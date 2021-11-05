@@ -1,24 +1,25 @@
-from LMPI import mpi_session, mpi_function
+from LMPI import MPI, MPISession, mpi_function
 import numpy as np
 
 
 def i_dont_want_to_parallelize(data):
     # Complicated stuff happens here
-    print(f"Serial: {mpi_session.rank}")
+    print(f"Serial: {MPI.COMM_WORLD.Get_rank()} {data}")
     return data
 
 
 @mpi_function
 def i_do_want_to_parallelize(data):
     # Expensive stuff happens here
-    print(f"Parallel: {mpi_session.rank}")
+    data = MPI.COMM_WORLD.bcast(data, 0)
+    print(f"Parallel: {MPI.COMM_WORLD.Get_rank()} {data}")
     return data
 
 
 def main():
     mode = 2
 
-    data = np.random.random(10)
+    data = np.random.random(4)
 
     if mode == 3:
         data = i_dont_want_to_parallelize(data)
@@ -35,4 +36,4 @@ def main():
 
 
 if __name__ == "__main__":
-    mpi_session(main)
+    MPISession(main)

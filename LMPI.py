@@ -1,74 +1,172 @@
 from mpi4py import MPI
 import pkgutil
+from typing import Callable, Iterable
+import inspect
 
 
-# Decorator to tag functions as mpi functions
-def mpi_function(func):
+def mpi_function(func: Callable):
+    """
+    Decorator to tag a function as parallel. Within
+    such a function, MPI calls can be made. The arguments
+    to the function will be automatically synchronised
+    across processes.
+
+    Parameters
+    ----------
+    func: Callable
+        The function that will be tagged as parallel.
+
+    Returns
+    -------
+        A wrapped version of the function, that is
+        known to LMPI as a parallel function.
+    """
 
     # Wrap the function up
     def wrapper(*args, **kwargs):
-
         if MPI.COMM_WORLD.Get_rank() == 0:
-            # Tell the worker processes what to do
-            MPI.COMM_WORLD.bcast(func.__name__, 0)
-            MPI.COMM_WORLD.bcast(args, 0)
+            # Tell the worker processes what to do (i.e tell them the function id)
+            MPI.COMM_WORLD.bcast(MPISession.mpi_function_ids[func.__name__], 0)
 
         return func(*args, **kwargs)
 
     # The wrapped function is now an mpi function
     wrapper.mpi_function_name = func.__name__
+    wrapper.argument_count = len(inspect.signature(func).parameters)
+
     return wrapper
 
 
-# Function to start an mpi session
-def mpi_session(main):
+class MPISession:
 
-    # Initialize the collection of mpi functions
-    mpi_session.mpi_functions = {}
-    mpi_session.rank = MPI.COMM_WORLD.Get_rank()
+    def __init__(self, main: Callable, modules: Iterable[str] = None):
+        """
+        Starts an MPI session.
 
-    # Iterate over modules
-    for p in pkgutil.iter_modules():
+        Parameters
+        ----------
+        main: Callable
+            The main driver function of the program. Any
+            functions that you want to parallelize should
+            be called (either directly, or indirectly) by
+            this function.
+        modules: Iterable[str]
+            The module names that LMPI will search for MPI
+            functions (functions decorated with @mpi_function).
+            Will also search submodules recursively.
+        """
 
-        # This will be replaced with a check
-        # that we are in the QUEST codebase
-        if p[1] == "test":
+        if modules is None:
+            caller = inspect.stack()[1]
+            modules = [caller.filename.replace(".py","")]
 
-            # Import the module
-            p = __import__(p.name)
+        # Build function maps
+        MPISession.find_mpi_functions(modules)
 
-            # Search the imported module for mpi functions
-            for f in dir(p):
-                f = getattr(p, f)
-                if hasattr(f, "mpi_function_name"):
-                    name = getattr(f, "mpi_function_name")
-                    mpi_session.mpi_functions[name] = f
+        # Call main on the root process
+        if MPI.COMM_WORLD.Get_rank() == 0:
+            main()
+            MPI.COMM_WORLD.bcast(-1)  # Tell workers we're done
 
-    # Call main on the root process
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        main()
-        MPI.COMM_WORLD.bcast("__session_finished__")
+        # Wait for work on all other processes
+        else:
+            MPISession.await_work()
 
-    # Wait for work on all other processes
-    else:
+    ################
+    # STATIC STUFF #
+    ################
+
+    mpi_functions = []  # List of mpi functions
+    mpi_function_ids = {}  # Dictionary of mpi function indices, keyed by function name
+
+    @staticmethod
+    def await_work():
+        """
+        Called on worker processes to listen for and
+        carry out work requests from the root process.
+        """
         while True:
 
             # Wait for the name of the function that
             # the root process wants us to execute
-            function_name = MPI.COMM_WORLD.bcast(None, 0)
+            function_id = MPI.COMM_WORLD.bcast(None, 0)
 
             # Special case, mpi session has finished
-            if function_name == "__session_finished__":
-                break # We're done
+            if function_id < 0:
+                break  # We're done
 
             # Locate the function that needs calling
-            if not function_name in mpi_session.mpi_functions:
-                raise Exception(f"Unknown MPI function: {function_name}")
-            work_function = mpi_session.mpi_functions[function_name]
-
-            # Wait for the arguments that the root process
-            # wants us to pass to the function
-            arguments = MPI.COMM_WORLD.bcast(None, 0)
+            if 0 <= function_id < len(MPISession.mpi_functions):
+                work_function = MPISession.mpi_functions[function_id]
+            else:
+                raise Exception(f"Unknown MPI function id: {function_id}")
 
             # Call the work function
-            work_function(*arguments)
+            work_function([None] * getattr(work_function, "argument_count"))
+
+    @staticmethod
+    def recurse_modules(path: str):
+        """
+        Recursively return the path to all modules
+        and submodules at the given path.
+
+        Parameters
+        ----------
+        path: str
+            The path where we start searching for modules
+            (is immediately yielded by the function).
+        Yields
+        ------
+        path: str
+            The next path in a depth-first recursive
+            search for submodules at path.
+        """
+        yield path
+        for p in pkgutil.walk_packages(path):
+            next_path = f"{p.module_finder.path}/{p.name}"
+            yield next_path
+            yield from MPISession.recurse_modules(next_path)
+
+    @staticmethod
+    def find_mpi_functions(modules: Iterable[str]):
+        """
+        Call to enumerate all mpi functions and build
+        the following function maps:
+            MPISession.mpi_functions
+            MPISession.mpi_function_ids
+
+        Parameters
+        ----------
+        modules: Iterable[str]
+            The module names that to will search for MPI
+            functions (functions decorated with @mpi_function).
+            Will also search submodules recursively.
+        """
+        module_set = set(modules)
+
+        # Will contain all mpi functions
+        mpi_functions = {}
+
+        # Iterate over modules
+        for p in pkgutil.iter_modules():
+
+            # This will be replaced with a check
+            # that we are in the QUEST codebase
+            if p.name in module_set:
+
+                # Import the module
+                p = __import__(p.name)
+
+                # Search the imported module for mpi functions
+                for f in dir(p):
+                    f = getattr(p, f)
+                    if hasattr(f, "mpi_function_name"):
+                        name = getattr(f, "mpi_function_name")
+                        mpi_functions[name] = f
+
+        # Build function maps
+        MPISession.mpi_function_ids = {}
+        MPISession.mpi_functions = []
+        for i, name in enumerate(sorted(mpi_functions)):
+            MPISession.mpi_function_ids[name] = i  # Map from name to id
+            MPISession.mpi_functions.append(mpi_functions[name])  # Map from id to function
