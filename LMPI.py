@@ -58,7 +58,7 @@ class MPISession:
 
         if modules is None:
             caller = inspect.stack()[1]
-            modules = [caller.filename.replace(".py","")]
+            modules = [caller.filename.replace(".py", "")]
 
         # Build function maps
         MPISession.find_mpi_functions(modules)
@@ -122,7 +122,7 @@ class MPISession:
             search for submodules at path.
         """
         yield path
-        for p in pkgutil.walk_packages(path):
+        for p in pkgutil.walk_packages([path]):
             next_path = f"{p.module_finder.path}/{p.name}"
             yield next_path
             yield from MPISession.recurse_modules(next_path)
@@ -154,15 +154,28 @@ class MPISession:
             # that we are in the QUEST codebase
             if p.name in module_set:
 
-                # Import the module
-                p = __import__(p.name)
+                path = f"{p.module_finder.path}/{p.name}"
+                for mod in MPISession.recurse_modules(path):
 
-                # Search the imported module for mpi functions
-                for f in dir(p):
-                    f = getattr(p, f)
-                    if hasattr(f, "mpi_function_name"):
-                        name = getattr(f, "mpi_function_name")
-                        mpi_functions[name] = f
+                    # Check if the module contains mpi_function
+                    # This is done so that we don't have to
+                    # import every module that we scan.
+                    with open(mod + ".py", "r") as mod_file:
+                        if not ("@mpi_function" in mod_file.read()):
+                            continue
+
+                    try:
+                        # Import the module
+                        mod = __import__(mod.replace(path, p.name).replace("/", "."))
+                    except:
+                        continue
+
+                    # Search the imported module for mpi functions
+                    for f in dir(mod):
+                        f = getattr(mod, f)
+                        if hasattr(f, "mpi_function_name"):
+                            name = getattr(f, "mpi_function_name")
+                            mpi_functions[name] = f
 
         # Build function maps
         MPISession.mpi_function_ids = {}
